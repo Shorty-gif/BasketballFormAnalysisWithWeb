@@ -876,26 +876,28 @@ with tab_vid:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TAB 3 — LIVE WEBCAM (streamlit-webrtc, no flicker)
+# TAB 3 — LIVE WEBCAM  (metrics drawn ON the frame — no flicker)
 # ═══════════════════════════════════════════════════════════════════
 with tab_cam:
     st.markdown("#### Real-time pose estimation")
     st.markdown(
         '<div class="info-box">'
-        'Live webcam analysis runs directly in your browser. '
-        'Click <strong>START</strong>, allow camera access when prompted, '
-        'and pose estimation will run on each frame in real time.'
+        'Live webcam analysis — scores and joint angles are drawn directly '
+        'onto the video feed. Click <strong>START</strong> and allow camera access.'
         '</div>',
         unsafe_allow_html=True,
     )
 
     try:
-        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
+        from streamlit_webrtc import (
+            webrtc_streamer, VideoProcessorBase,
+            RTCConfiguration, WebRtcMode
+        )
         import av
         import queue
         import threading
 
-        # ── TURN/STUN — required for Streamlit Cloud ───────────────────
+        # ── TURN/STUN config ───────────────────────────────────────────
         RTC_CONFIGURATION = RTCConfiguration({
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]},
@@ -913,188 +915,240 @@ with tab_cam:
             ]
         })
 
-        # ── Session state init ─────────────────────────────────────────
-        if "webrtc_metrics_history" not in st.session_state:
-            st.session_state["webrtc_metrics_history"] = []
+        # ── Session state ──────────────────────────────────────────────
+        if "cam_history" not in st.session_state:
+            st.session_state["cam_history"] = []
 
-        # ── Thread-safe queue to pass metrics from processor to UI ─────
-        metrics_queue: queue.Queue = queue.Queue(maxsize=1)
+        # Queue for passing metrics out to session summary
+        if "cam_result_queue" not in st.session_state:
+            st.session_state["cam_result_queue"] = queue.Queue(maxsize=50)
 
-        # ── Video processor — runs in its own thread, never blocks UI ──
+        # ── Drawing helpers (pure OpenCV — no Streamlit) ───────────────
+        def cv_color(score: int):
+            if score >= 85: return (100, 220, 50)   # green  BGR
+            if score >= 60: return (50,  200, 255)  # amber
+            return (50, 80, 230)                    # red
+
+        def draw_rounded_rect(img, x1, y1, x2, y2, color, alpha=0.55):
+            overlay = img.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+            cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+        def draw_metrics_overlay(frame: np.ndarray, result: dict) -> np.ndarray:
+            """
+            Draws a HUD panel directly onto the frame.
+            All rendering is pure OpenCV — runs in the processor thread.
+            """
+            h, w = frame.shape[:2]
+
+            overall  = result.get("overall_score", 0)
+            grade    = result.get("grade", "—")
+            phase    = result.get("phase", "unknown").replace("_", " ").title()
+            scores   = result.get("scores", {})
+
+            # ── Panel background (top-right) ───────────────────────────
+            panel_x  = w - 260
+            panel_y  = 10
+            panel_w  = 245
+            panel_h  = 230
+            draw_rounded_rect(
+                frame,
+                panel_x - 8, panel_y - 8,
+                panel_x + panel_w, panel_y + panel_h,
+                (10, 10, 20), alpha=0.70
+            )
+
+            # ── Score ──────────────────────────────────────────────────
+            score_col_bgr = cv_color(overall)
+            cv2.putText(
+                frame, str(overall),
+                (panel_x + 5, panel_y + 52),
+                cv2.FONT_HERSHEY_DUPLEX, 1.8,
+                score_col_bgr, 3
+            )
+            cv2.putText(
+                frame, "/100",
+                (panel_x + 88, panel_y + 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (150, 150, 150), 1
+            )
+
+            # ── Grade pill ─────────────────────────────────────────────
+            cv2.putText(
+                frame, f"Grade {grade}",
+                (panel_x + 130, panel_y + 50),
+                cv2.FONT_HERSHEY_DUPLEX, 0.75,
+                score_col_bgr, 2
+            )
+
+            # ── Phase tag ──────────────────────────────────────────────
+            cv2.putText(
+                frame, phase,
+                (panel_x + 5, panel_y + 78),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (180, 180, 180), 1
+            )
+
+            # ── Divider ────────────────────────────────────────────────
+            cv2.line(
+                frame,
+                (panel_x - 8, panel_y + 88),
+                (panel_x + panel_w, panel_y + 88),
+                (40, 40, 60), 1
+            )
+
+            # ── Joint angle bars ───────────────────────────────────────
+            bar_items = [
+                ("Elbow",    "elbow_angle",          result.get("elbow_angle", 0),          "°"),
+                ("Knee",     "knee_angle",            result.get("knee_angle", 0),           "°"),
+                ("Shoulder", "shoulder_angle",        result.get("shoulder_angle", 0),       "°"),
+                ("Wrist",    "wrist_elbow_vertical",  result.get("wrist_elbow_vertical", 0), "°"),
+                ("Hip",      "hip_knee_alignment",    result.get("hip_knee_alignment", 0),   ""),
+            ]
+
+            bar_y = panel_y + 100
+            bar_w = 140
+            bar_h = 7
+
+            for label, key, val, unit in bar_items:
+                sc = scores.get(key, 50)
+                fill_w = int(bar_w * sc / 100)
+                col    = cv_color(sc)
+
+                # Label
+                fmt = f"{val:.2f}" if key == "hip_knee_alignment" else f"{val:.0f}{unit}"
+                cv2.putText(
+                    frame, f"{label}: {fmt}",
+                    (panel_x + 5, bar_y - 1),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (180, 180, 180), 1
+                )
+
+                # Track
+                cv2.rectangle(
+                    frame,
+                    (panel_x + 5, bar_y + 2),
+                    (panel_x + 5 + bar_w, bar_y + 2 + bar_h),
+                    (40, 40, 60), -1
+                )
+
+                # Fill
+                if fill_w > 0:
+                    cv2.rectangle(
+                        frame,
+                        (panel_x + 5, bar_y + 2),
+                        (panel_x + 5 + fill_w, bar_y + 2 + bar_h),
+                        col, -1
+                    )
+
+                bar_y += 24
+
+            # ── Red flags (bottom-left) ────────────────────────────────
+            try:
+                from analysis.pose_analysis import detect_red_flags
+                flags = detect_red_flags(result)
+                flag_y = h - 20 - (len(flags) * 22)
+                for flag in flags[:3]:
+                    short = flag.split(":")[0]   # e.g. "CHICKEN_WING"
+                    draw_rounded_rect(
+                        frame,
+                        8, flag_y - 16,
+                        8 + len(short) * 9 + 10, flag_y + 6,
+                        (30, 30, 180), alpha=0.65
+                    )
+                    cv2.putText(
+                        frame, short,
+                        (12, flag_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (100, 100, 255), 1
+                    )
+                    flag_y += 22
+            except Exception:
+                pass
+
+            return frame
+
+        # ── Video processor ────────────────────────────────────────────
         class BasketballPoseProcessor(VideoProcessorBase):
             def __init__(self):
-                self.frame_count = 0
-                self.last_ann    = None   # last annotated frame
+                self.frame_count  = 0
+                self.last_result  = None
+                self.last_ann     = None
 
             def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
                 img = frame.to_ndarray(format="bgr24")
                 self.frame_count += 1
 
-                # Analyse every 3rd frame for speed
                 if self.frame_count % 3 == 0:
                     try:
                         result = analyse_frame(img)
                         if result:
                             ann = result.pop("annotated_frame", img)
-                            self.last_ann = ann
+                            self.last_result = result
+                            self.last_ann    = ann
 
-                            # Push metrics to queue (drop old if full)
-                            try:
-                                metrics_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                            metrics_queue.put_nowait(result)
+                            # Push to queue for session summary
+                            q = st.session_state.get("cam_result_queue")
+                            if q is not None:
+                                try:
+                                    q.put_nowait(result)
+                                except queue.Full:
+                                    pass
 
-                            return av.VideoFrame.from_ndarray(ann, format="bgr24")
                     except Exception:
                         pass
 
-                # Return last annotated frame if we skipped analysis
-                if self.last_ann is not None:
-                    return av.VideoFrame.from_ndarray(self.last_ann, format="bgr24")
-                return frame
+                # Draw HUD on every frame using last known result
+                base = self.last_ann if self.last_ann is not None else img
+                if self.last_result is not None:
+                    base = draw_metrics_overlay(base.copy(), self.last_result)
 
-        # ── Layout ─────────────────────────────────────────────────────
-        col_cam, col_metrics = st.columns([3, 2], gap="medium")
+                return av.VideoFrame.from_ndarray(base, format="bgr24")
 
-        with col_cam:
-            ctx = webrtc_streamer(
-                key="basketball-pose",
-                mode=WebRtcMode.SENDRECV,
-                video_processor_factory=BasketballPoseProcessor,
-                rtc_configuration=RTC_CONFIGURATION,
-                media_stream_constraints={
-                    "video": {
-                        "width":  {"ideal": 640},
-                        "height": {"ideal": 480},
-                        "frameRate": {"ideal": 30},
-                    },
-                    "audio": False,
+        # ── Streamer ───────────────────────────────────────────────────
+        ctx = webrtc_streamer(
+            key="basketball-pose",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=BasketballPoseProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={
+                "video": {
+                    "width":  {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 30},
                 },
-                async_processing=True,
-            )
+                "audio": False,
+            },
+            async_processing=True,
+        )
 
-        # ── Live metrics panel ─────────────────────────────────────────
-        with col_metrics:
-            st.markdown("#### Live Metrics")
+        st.caption(
+            "Scores, grades, and joint angles are drawn directly on the feed. "
+            "🟢 Green = good  🟡 Amber = acceptable  🔴 Red = needs work"
+        )
 
-            if ctx.state.playing:
-                st.success("🔴 Live — analysing form...")
+        # ── Session summary (only shown after stopping) ────────────────
+        summary_ph = st.empty()
 
-                # Drain the queue and display latest result
-                latest = None
-                try:
-                    while True:
-                        latest = metrics_queue.get_nowait()
-                except queue.Empty:
-                    pass
+        if not ctx.state.playing:
+            # Drain queue into history
+            q = st.session_state.get("cam_result_queue")
+            if q is not None:
+                while True:
+                    try:
+                        item = q.get_nowait()
+                        st.session_state["cam_history"].append(item)
+                    except queue.Empty:
+                        break
 
-                if latest:
-                    # Save to history
-                    history = st.session_state["webrtc_metrics_history"]
-                    history.append(latest)
-                    st.session_state["webrtc_metrics_history"] = history[-300:]
+            history = st.session_state.get("cam_history", [])
 
-                    # ── Score card ─────────────────────────────────────
-                    overall = latest.get("overall_score", 0)
-                    grade   = latest.get("grade", get_grade(overall))
-                    phase   = latest.get("phase", "unknown")
-
-                    st.markdown(f"""
-                    <div class="card" style="text-align:center">
-                      <div class="card-title">Live Form Score</div>
-                      <div class="big-score"
-                           style="color:{score_col(overall)};font-size:4rem">
-                        {overall}
-                      </div>
-                      <div class="score-denom">out of 100</div>
-                      <div class="grade-pill" style="
-                           background:{grade_col(grade)}18;
-                           color:{grade_col(grade)};
-                           border:1px solid {grade_col(grade)}40">
-                        Grade &nbsp;{grade}
-                      </div>
-                      <div style="margin-top:0.8rem">
-                        <span class="phase-tag" style="
-                              background:{phase_col(phase)}18;
-                              color:{phase_col(phase)};
-                              border:1px solid {phase_col(phase)}40">
-                          {phase.replace("_"," ").title()}
-                        </span>
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                    # ── Joint angle bars ───────────────────────────────
-                    scores = latest.get("scores", {})
-                    bars_html = '<div class="card"><div class="card-title">Joint Angles</div>'
-                    for key, label, unit in [
-                        ("elbow_angle",          "Elbow",      "°"),
-                        ("knee_angle",           "Knee",       "°"),
-                        ("shoulder_angle",       "Shoulder",   "°"),
-                        ("wrist_elbow_vertical", "Wrist",      "°"),
-                        ("hip_knee_alignment",   "Hip Align",  ""),
-                    ]:
-                        val = latest.get(key, 0)
-                        sc  = scores.get(key, 50)
-                        fmt = f"{val:.3f}" if key == "hip_knee_alignment" else f"{val:.1f}"
-                        bars_html += f"""
-                        <div class="m-wrap">
-                          <div class="m-head">
-                            <span>{label}</span>
-                            <span class="m-val">{fmt}{unit}</span>
-                          </div>
-                          <div class="m-track">
-                            <div class="m-fill"
-                                 style="width:{sc}%;background:{score_col(sc)}">
-                            </div>
-                          </div>
-                        </div>"""
-                    bars_html += "</div>"
-                    st.markdown(bars_html, unsafe_allow_html=True)
-
-                    # ── Red flags ──────────────────────────────────────
-                    from analysis.pose_analysis import detect_red_flags
-                    flags = detect_red_flags(latest)
-                    if flags:
-                        st.markdown("**⚠️ Form Alerts**")
-                        for flag in flags:
-                            st.markdown(
-                                f'<div class="flag-box">⚡ {flag}</div>',
-                                unsafe_allow_html=True
-                            )
-
-                    # ── Priority cue ───────────────────────────────────
-                    feedback = latest.get("feedback", {})
-                    if feedback and scores:
-                        worst = min(scores, key=lambda k: scores[k])
-                        cue   = feedback.get(worst, "")
-                        if cue:
-                            st.markdown(
-                                f'<div class="priority-box">'
-                                f'💡 <strong>Priority:</strong> {cue}'
-                                f'</div>',
-                                unsafe_allow_html=True
-                            )
-
-                else:
-                    st.info("Waiting for first pose detection...")
-
-            else:
-                st.markdown(
-                    '<div class="info-box">'
-                    'Press <strong>START</strong> on the left to begin.<br>'
-                    'Allow camera access when your browser asks.'
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # ── Show session summary when stopped ──────────────────
-                history = st.session_state.get("webrtc_metrics_history", [])
-                if len(history) > 5:
+            if len(history) > 5:
+                with summary_ph.container():
                     st.markdown("---")
                     st.markdown(
-                        f"**Last session: {len(history)} frames captured**"
+                        f"### 📊 Session Summary  "
+                        f"*({len(history)} frames)*"
                     )
                     session = aggregate_session(history)
                     render_session_summary(session)
@@ -1115,16 +1169,17 @@ with tab_cam:
                     else:
                         st.info(
                             "Add your Gemini API key in the sidebar "
-                            "to get AI coaching after your session."
+                            "for AI coaching after your session."
                         )
 
                     if st.button("🗑 Clear session", key="clear_webrtc"):
-                        st.session_state["webrtc_metrics_history"] = []
+                        st.session_state["cam_history"] = []
+                        st.session_state["cam_result_queue"] = queue.Queue(maxsize=50)
+                        summary_ph.empty()
                         st.rerun()
 
     except ImportError:
         st.error(
             "streamlit-webrtc is not installed. "
-            "Add `streamlit-webrtc>=0.47.0` and `av>=12.0.0` "
-            "to your requirements.txt and redeploy."
+            "Add `streamlit-webrtc>=0.47.0` and `av>=12.0.0` to requirements.txt."
         )
