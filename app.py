@@ -876,24 +876,26 @@ with tab_vid:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TAB 3 — LIVE WEBCAM (streamlit-webrtc, works on Streamlit Cloud)
+# TAB 3 — LIVE WEBCAM (streamlit-webrtc, no flicker)
 # ═══════════════════════════════════════════════════════════════════
 with tab_cam:
     st.markdown("#### Real-time pose estimation")
     st.markdown(
         '<div class="info-box">'
         'Live webcam analysis runs directly in your browser. '
-        'Click <strong>START</strong>, allow camera access, and pose '
-        'estimation will run on each frame in real time.'
+        'Click <strong>START</strong>, allow camera access when prompted, '
+        'and pose estimation will run on each frame in real time.'
         '</div>',
         unsafe_allow_html=True,
     )
 
     try:
-        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+        from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration, WebRtcMode
         import av
+        import queue
+        import threading
 
-        # ── TURN/STUN config — needed for Streamlit Cloud ──────────────
+        # ── TURN/STUN — required for Streamlit Cloud ───────────────────
         RTC_CONFIGURATION = RTCConfiguration({
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]},
@@ -911,35 +913,45 @@ with tab_cam:
             ]
         })
 
-        # ── Session state for storing live metrics ──────────────────────
-        if "webrtc_metrics" not in st.session_state:
-            st.session_state["webrtc_metrics"] = []
-        if "webrtc_latest" not in st.session_state:
-            st.session_state["webrtc_latest"] = None
+        # ── Session state init ─────────────────────────────────────────
+        if "webrtc_metrics_history" not in st.session_state:
+            st.session_state["webrtc_metrics_history"] = []
 
-        # ── Video processor — runs on every frame ──────────────────────
+        # ── Thread-safe queue to pass metrics from processor to UI ─────
+        metrics_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        # ── Video processor — runs in its own thread, never blocks UI ──
         class BasketballPoseProcessor(VideoProcessorBase):
             def __init__(self):
-                self.latest_metrics = None
-                self.frame_count    = 0
+                self.frame_count = 0
+                self.last_ann    = None   # last annotated frame
 
             def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
                 img = frame.to_ndarray(format="bgr24")
-
-                # Analyse every 3rd frame for performance
                 self.frame_count += 1
+
+                # Analyse every 3rd frame for speed
                 if self.frame_count % 3 == 0:
                     try:
                         result = analyse_frame(img)
                         if result:
                             ann = result.pop("annotated_frame", img)
-                            self.latest_metrics = result
-                            # Store in session state for the metrics panel
-                            st.session_state["webrtc_latest"] = result
+                            self.last_ann = ann
+
+                            # Push metrics to queue (drop old if full)
+                            try:
+                                metrics_queue.get_nowait()
+                            except queue.Empty:
+                                pass
+                            metrics_queue.put_nowait(result)
+
                             return av.VideoFrame.from_ndarray(ann, format="bgr24")
                     except Exception:
                         pass
 
+                # Return last annotated frame if we skipped analysis
+                if self.last_ann is not None:
+                    return av.VideoFrame.from_ndarray(self.last_ann, format="bgr24")
                 return frame
 
         # ── Layout ─────────────────────────────────────────────────────
@@ -948,6 +960,7 @@ with tab_cam:
         with col_cam:
             ctx = webrtc_streamer(
                 key="basketball-pose",
+                mode=WebRtcMode.SENDRECV,
                 video_processor_factory=BasketballPoseProcessor,
                 rtc_configuration=RTC_CONFIGURATION,
                 media_stream_constraints={
@@ -961,127 +974,157 @@ with tab_cam:
                 async_processing=True,
             )
 
+        # ── Live metrics panel ─────────────────────────────────────────
         with col_metrics:
             st.markdown("#### Live Metrics")
 
-            metrics_placeholder = st.empty()
-            stop_placeholder    = st.empty()
-
             if ctx.state.playing:
-                st.success("🔴 Camera active — analysing form...")
+                st.success("🔴 Live — analysing form...")
 
-                # Poll for latest metrics while streaming
-                import time
-                while ctx.state.playing:
-                    latest = st.session_state.get("webrtc_latest")
-                    if latest:
-                        with metrics_placeholder.container():
-                            overall = latest.get("overall_score", 0)
-                            grade   = latest.get("grade", "—")
-                            phase   = latest.get("phase", "unknown")
+                # Drain the queue and display latest result
+                latest = None
+                try:
+                    while True:
+                        latest = metrics_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
-                            st.markdown(f"""
-                            <div class="card" style="text-align:center">
-                              <div class="card-title">Live Form Score</div>
-                              <div class="big-score" style="color:{score_col(overall)};
-                                   font-size:4rem">{overall}</div>
-                              <div class="score-denom">out of 100</div>
-                              <div class="grade-pill" style="
-                                   background:{grade_col(grade)}18;
-                                   color:{grade_col(grade)};
-                                   border:1px solid {grade_col(grade)}40">
-                                Grade &nbsp;{grade}
-                              </div>
-                              <div style="margin-top:0.8rem">
-                                <span class="phase-tag" style="
-                                      background:{phase_col(phase)}18;
-                                      color:{phase_col(phase)};
-                                      border:1px solid {phase_col(phase)}40">
-                                  {phase.replace("_"," ").title()}
-                                </span>
-                              </div>
+                if latest:
+                    # Save to history
+                    history = st.session_state["webrtc_metrics_history"]
+                    history.append(latest)
+                    st.session_state["webrtc_metrics_history"] = history[-300:]
+
+                    # ── Score card ─────────────────────────────────────
+                    overall = latest.get("overall_score", 0)
+                    grade   = latest.get("grade", get_grade(overall))
+                    phase   = latest.get("phase", "unknown")
+
+                    st.markdown(f"""
+                    <div class="card" style="text-align:center">
+                      <div class="card-title">Live Form Score</div>
+                      <div class="big-score"
+                           style="color:{score_col(overall)};font-size:4rem">
+                        {overall}
+                      </div>
+                      <div class="score-denom">out of 100</div>
+                      <div class="grade-pill" style="
+                           background:{grade_col(grade)}18;
+                           color:{grade_col(grade)};
+                           border:1px solid {grade_col(grade)}40">
+                        Grade &nbsp;{grade}
+                      </div>
+                      <div style="margin-top:0.8rem">
+                        <span class="phase-tag" style="
+                              background:{phase_col(phase)}18;
+                              color:{phase_col(phase)};
+                              border:1px solid {phase_col(phase)}40">
+                          {phase.replace("_"," ").title()}
+                        </span>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # ── Joint angle bars ───────────────────────────────
+                    scores = latest.get("scores", {})
+                    bars_html = '<div class="card"><div class="card-title">Joint Angles</div>'
+                    for key, label, unit in [
+                        ("elbow_angle",          "Elbow",      "°"),
+                        ("knee_angle",           "Knee",       "°"),
+                        ("shoulder_angle",       "Shoulder",   "°"),
+                        ("wrist_elbow_vertical", "Wrist",      "°"),
+                        ("hip_knee_alignment",   "Hip Align",  ""),
+                    ]:
+                        val = latest.get(key, 0)
+                        sc  = scores.get(key, 50)
+                        fmt = f"{val:.3f}" if key == "hip_knee_alignment" else f"{val:.1f}"
+                        bars_html += f"""
+                        <div class="m-wrap">
+                          <div class="m-head">
+                            <span>{label}</span>
+                            <span class="m-val">{fmt}{unit}</span>
+                          </div>
+                          <div class="m-track">
+                            <div class="m-fill"
+                                 style="width:{sc}%;background:{score_col(sc)}">
                             </div>
-                            """, unsafe_allow_html=True)
+                          </div>
+                        </div>"""
+                    bars_html += "</div>"
+                    st.markdown(bars_html, unsafe_allow_html=True)
 
-                            # Joint angle bars
-                            scores   = latest.get("scores",   {})
-                            bars_html = '<div class="card"><div class="card-title">Joint Angles</div>'
-                            metrics_def = [
-                                ("elbow_angle",          "Elbow",     latest.get("elbow_angle", 0),        "°"),
-                                ("knee_angle",           "Knee",      latest.get("knee_angle", 0),         "°"),
-                                ("shoulder_angle",       "Shoulder",  latest.get("shoulder_angle", 0),     "°"),
-                                ("wrist_elbow_vertical", "Wrist",     latest.get("wrist_elbow_vertical",0),"°"),
-                                ("hip_knee_alignment",   "Hip align", latest.get("hip_knee_alignment",0),  ""),
-                            ]
-                            for key, label, val, unit in metrics_def:
-                                sc  = scores.get(key, 50)
-                                fmt = f"{val:.3f}" if key == "hip_knee_alignment" else f"{val:.1f}"
-                                bars_html += f"""
-                                <div class="m-wrap">
-                                  <div class="m-head">
-                                    <span>{label}</span>
-                                    <span class="m-val">{fmt}{unit}</span>
-                                  </div>
-                                  <div class="m-track">
-                                    <div class="m-fill" style="width:{sc}%;
-                                         background:{score_col(sc)}"></div>
-                                  </div>
-                                </div>"""
-                            bars_html += "</div>"
-                            st.markdown(bars_html, unsafe_allow_html=True)
-
-                            # Red flags
-                            from analysis.pose_analysis import detect_red_flags
-                            flags = detect_red_flags(latest)
-                            if flags:
-                                for flag in flags:
-                                    st.markdown(
-                                        f'<div class="flag-box">⚡ {flag}</div>',
-                                        unsafe_allow_html=True
-                                    )
-
-                            # Save to session history
-                            history = st.session_state.get("webrtc_metrics", [])
-                            history.append(latest)
-                            st.session_state["webrtc_metrics"] = history[-200:]
-
-                    time.sleep(0.1)
-
-            else:
-                metrics_placeholder.info(
-                    "Press **START** above to begin live analysis."
-                )
-
-        # ── Session summary after stopping ─────────────────────────────
-        if not ctx.state.playing:
-            history = st.session_state.get("webrtc_metrics", [])
-            if len(history) > 5:
-                st.markdown("---")
-                st.markdown("### 📊 Session Summary")
-                session = aggregate_session(history)
-                render_session_summary(session)
-
-                if st.session_state.get("gemini_key"):
-                    if st.button("🤖 Get Gemini Coaching for this session",
-                                 key="gem_webrtc"):
-                        with st.spinner("Calling Gemini…"):
-                            coaching = call_gemini(session, history)
-                        if coaching:
-                            st.markdown("### 🤖 Gemini Coaching Feedback")
+                    # ── Red flags ──────────────────────────────────────
+                    from analysis.pose_analysis import detect_red_flags
+                    flags = detect_red_flags(latest)
+                    if flags:
+                        st.markdown("**⚠️ Form Alerts**")
+                        for flag in flags:
                             st.markdown(
-                                f'<div class="gemini-box">{coaching}</div>',
+                                f'<div class="flag-box">⚡ {flag}</div>',
                                 unsafe_allow_html=True
                             )
-                else:
-                    st.info("Add your Gemini API key in the sidebar for AI coaching.")
 
-                if st.button("🗑 Clear session", key="clear_webrtc"):
-                    st.session_state["webrtc_metrics"] = []
-                    st.session_state["webrtc_latest"]  = None
-                    st.rerun()
+                    # ── Priority cue ───────────────────────────────────
+                    feedback = latest.get("feedback", {})
+                    if feedback and scores:
+                        worst = min(scores, key=lambda k: scores[k])
+                        cue   = feedback.get(worst, "")
+                        if cue:
+                            st.markdown(
+                                f'<div class="priority-box">'
+                                f'💡 <strong>Priority:</strong> {cue}'
+                                f'</div>',
+                                unsafe_allow_html=True
+                            )
+
+                else:
+                    st.info("Waiting for first pose detection...")
+
+            else:
+                st.markdown(
+                    '<div class="info-box">'
+                    'Press <strong>START</strong> on the left to begin.<br>'
+                    'Allow camera access when your browser asks.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # ── Show session summary when stopped ──────────────────
+                history = st.session_state.get("webrtc_metrics_history", [])
+                if len(history) > 5:
+                    st.markdown("---")
+                    st.markdown(
+                        f"**Last session: {len(history)} frames captured**"
+                    )
+                    session = aggregate_session(history)
+                    render_session_summary(session)
+
+                    if st.session_state.get("gemini_key"):
+                        if st.button(
+                            "🤖 Get Gemini Coaching",
+                            key="gem_webrtc"
+                        ):
+                            with st.spinner("Calling Gemini…"):
+                                coaching = call_gemini(session, history)
+                            if coaching:
+                                st.markdown("### 🤖 Gemini Coaching Feedback")
+                                st.markdown(
+                                    f'<div class="gemini-box">{coaching}</div>',
+                                    unsafe_allow_html=True
+                                )
+                    else:
+                        st.info(
+                            "Add your Gemini API key in the sidebar "
+                            "to get AI coaching after your session."
+                        )
+
+                    if st.button("🗑 Clear session", key="clear_webrtc"):
+                        st.session_state["webrtc_metrics_history"] = []
+                        st.rerun()
 
     except ImportError:
         st.error(
             "streamlit-webrtc is not installed. "
-            "Make sure your requirements.txt includes `streamlit-webrtc>=0.47.0` and `av>=12.0.0`."
+            "Add `streamlit-webrtc>=0.47.0` and `av>=12.0.0` "
+            "to your requirements.txt and redeploy."
         )
