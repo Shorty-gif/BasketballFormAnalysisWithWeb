@@ -1,10 +1,5 @@
 """
 inference/image_inference.py  —  v3
-Fixes:
-  - Phase detection now requires wrist above shoulder to confirm shooting
-  - Sideways detection: auto-detects camera angle and adjusts scoring
-  - Shoulder score bug fixed (was using wrong key in scores dict)
-  - Standing-still guard: won't call "follow_through" unless arm is raised
 """
 
 import cv2
@@ -31,7 +26,6 @@ KP = {
     "l_ankle":15,"r_ankle":16,
 }
 
-# Phase-specific standards. Shoulder = arm elevation from horizontal (0-90°).
 PHASE_STANDARDS = {
     "loading": {
         "elbow_angle":    (85,  115, 70,  135),
@@ -57,7 +51,7 @@ PHASE_STANDARDS = {
         "shoulder_angle": (62,  90,  48,  90),
         "wrist_elbow_v":  (0,   38,  0,   58),
     },
-    "not_shooting": {   # standing still / idle
+    "not_shooting": {
         "elbow_angle":    (80,  100, 60,  120),
         "knee_angle":     (160, 180, 140, 180),
         "shoulder_angle": (0,   30,  0,   45),
@@ -129,34 +123,19 @@ def ensure_color(frame: np.ndarray) -> np.ndarray:
 # ── Camera angle detection ─────────────────────────────────────────────────────
 
 def detect_camera_angle(kp: np.ndarray, kp_raw: np.ndarray) -> str:
-    """
-    Detects if the player is facing the camera (front-on) or sideways.
-    Uses shoulder width vs hip width ratio.
-    Front-on: both shoulders visible and wide apart.
-    Sideways: one shoulder hidden, narrow shoulder span.
-    Returns: 'front', 'sideways', or 'unknown'
-    """
     r_sh_conf = kp_conf(kp_raw, KP["r_shoulder"])
     l_sh_conf = kp_conf(kp_raw, KP["l_shoulder"])
-
-    # If one shoulder is very low confidence, likely sideways
     if min(r_sh_conf, l_sh_conf) < 0.25:
         return "sideways"
-
-    # Shoulder span in normalised coords
     sh_span = abs(float(kp[KP["r_shoulder"]][0]) - float(kp[KP["l_shoulder"]][0]))
-
-    # Hip span
     r_hip_conf = kp_conf(kp_raw, KP["r_hip"])
     l_hip_conf = kp_conf(kp_raw, KP["l_hip"])
     if min(r_hip_conf, l_hip_conf) > 0.25:
         hip_span = abs(float(kp[KP["r_hip"]][0]) - float(kp[KP["l_hip"]][0]))
-        # Front-on: shoulder span ≈ hip span, both > 0.08 of frame width
         if sh_span > 0.08 and hip_span > 0.06:
             return "front"
         if sh_span < 0.06:
             return "sideways"
-
     if sh_span < 0.05:
         return "sideways"
     return "front"
@@ -165,42 +144,6 @@ def detect_camera_angle(kp: np.ndarray, kp_raw: np.ndarray) -> str:
 
 def is_shooting_pose(kp: np.ndarray, kp_raw: np.ndarray,
                      elbow_angle: float, knee_angle: float) -> bool:
-    """
-    FIX #6: Guard against standing-still false positives.
-    Returns True only if the person appears to actually be shooting.
-
-    Requirements (any one of these):
-      - Wrist is above the shoulder (clear shooting position)
-      - Elbow is raised above shoulder level
-      - Knee is significantly bent (loading for a shot)
-    """
-    side = detect_side(kp, kp_raw)
-    if side == "right":
-        wrist_y   = float(kp[KP["r_wrist"]][1])
-        shoulder_y = float(kp[KP["r_shoulder"]][1])
-        elbow_y    = float(kp[KP["r_elbow"]][1])
-    else:
-        wrist_y    = float(kp[KP["l_wrist"]][1])
-        shoulder_y = float(kp[KP["l_shoulder"]][1])
-        elbow_y    = float(kp[KP["l_elbow"]][1])
-
-    # In image coords: lower y = higher in frame
-    wrist_above_shoulder = wrist_y < shoulder_y - 0.03
-    elbow_above_shoulder = elbow_y < shoulder_y + 0.02
-    knee_bent            = knee_angle < 155
-
-    return wrist_above_shoulder or elbow_above_shoulder or knee_bent
-
-# ── Phase detection ────────────────────────────────────────────────────────────
-
-def detect_phase(kp: np.ndarray, kp_raw: np.ndarray,
-                 knee_angle: float, elbow_angle: float) -> str:
-    """
-    FIX #2 + #6: Robust phase detection.
-    - Checks wrist position relative to shoulder (not just normalised y)
-    - Guards against standing-still → follow_through false positive
-    - Uses both arm and leg signals together
-    """
     side = detect_side(kp, kp_raw)
     if side == "right":
         wrist_y    = float(kp[KP["r_wrist"]][1])
@@ -210,33 +153,37 @@ def detect_phase(kp: np.ndarray, kp_raw: np.ndarray,
         wrist_y    = float(kp[KP["l_wrist"]][1])
         shoulder_y = float(kp[KP["l_shoulder"]][1])
         elbow_y    = float(kp[KP["l_elbow"]][1])
+    wrist_above_shoulder = wrist_y < shoulder_y - 0.03
+    elbow_above_shoulder = elbow_y < shoulder_y + 0.02
+    knee_bent            = knee_angle < 155
+    return wrist_above_shoulder or elbow_above_shoulder or knee_bent
 
-    # In image coords: lower y = higher up in frame
+# ── Phase detection ────────────────────────────────────────────────────────────
+
+def detect_phase(kp: np.ndarray, kp_raw: np.ndarray,
+                 knee_angle: float, elbow_angle: float) -> str:
+    side = detect_side(kp, kp_raw)
+    if side == "right":
+        wrist_y    = float(kp[KP["r_wrist"]][1])
+        shoulder_y = float(kp[KP["r_shoulder"]][1])
+        elbow_y    = float(kp[KP["r_elbow"]][1])
+    else:
+        wrist_y    = float(kp[KP["l_wrist"]][1])
+        shoulder_y = float(kp[KP["l_shoulder"]][1])
+        elbow_y    = float(kp[KP["l_elbow"]][1])
     wrist_above_shoulder = wrist_y < shoulder_y - 0.03
     wrist_near_shoulder  = abs(wrist_y - shoulder_y) < 0.10
     elbow_raised         = elbow_y < shoulder_y + 0.04
-
-    # FIX #6: Not shooting at all — arm down, legs straight
     if not wrist_above_shoulder and not elbow_raised and knee_angle > 158:
         return "not_shooting"
-
-    # Follow-through: arm fully extended AND wrist above or near shoulder
     if elbow_angle > 135 and (wrist_above_shoulder or wrist_near_shoulder):
         return "follow_through"
-
-    # Release: wrist clearly above shoulder, arm still somewhat bent
     if wrist_above_shoulder and elbow_angle <= 135:
         return "release"
-
-    # Loading: knee bent significantly
     if knee_angle < 128 and elbow_raised:
         return "loading"
-
-    # Set: elbow raised, not yet releasing
     if elbow_raised and wrist_near_shoulder:
         return "set"
-
-    # Fallback
     if wrist_above_shoulder:
         return "release"
     return "loading"
@@ -285,7 +232,6 @@ def extract_metrics(kp: np.ndarray, kp_raw: np.ndarray) -> Dict:
     elbow_angle    = angle_between(kp[sh], kp[el], kp[wr])
     knee_angle     = angle_between(kp[hp], kp[kn], kp[an])
 
-    # Arm elevation from horizontal (0=arm down/sideways, 90=arm straight up)
     sh_pt = kp[sh]; el_pt = kp[el]
     dx    = float(el_pt[0] - sh_pt[0])
     dy    = float(el_pt[1] - sh_pt[1])
@@ -295,22 +241,13 @@ def extract_metrics(kp: np.ndarray, kp_raw: np.ndarray) -> Dict:
 
     wrist_elbow_v  = vertical_angle(kp[el], kp[wr])
     hip_knee_align = float(abs(kp[hp][0] - kp[kn][0]))
+    phase          = detect_phase(kp, kp_raw, knee_angle, elbow_angle)
+    cam_angle      = detect_camera_angle(kp, kp_raw)
+    std            = PHASE_STANDARDS.get(phase, PHASE_STANDARDS["set"])
 
-    # FIX #2 + #6: use robust phase detection
-    phase = detect_phase(kp, kp_raw, knee_angle, elbow_angle)
-
-    # FIX #7: detect camera angle — sideways shots have different shoulder geometry
-    cam_angle = detect_camera_angle(kp, kp_raw)
-
-    std = PHASE_STANDARDS.get(phase, PHASE_STANDARDS["set"])
-
-    # FIX #4 + #7: use consistent key names in scores dict
-    # FIX #7: widen shoulder tolerance for sideways shots
     sh_ideal = std["shoulder_angle"][:2]
     sh_acc   = std["shoulder_angle"][2:]
     if cam_angle == "sideways":
-        # Sideways: shoulder elevation measurement is less reliable
-        # Widen acceptable range by 15° each side
         sh_ideal = (max(0, sh_ideal[0]-15), min(90, sh_ideal[1]+15))
         sh_acc   = (max(0, sh_acc[0]-20),   min(90, sh_acc[1]+20))
 
@@ -342,11 +279,11 @@ def extract_metrics(kp: np.ndarray, kp_raw: np.ndarray) -> Dict:
         return cues.get("too_high","Needs work")
 
     feedback = {
-        "elbow_angle":          get_cue("elbow_angle",          elbow_angle,    std["elbow_angle"][:2]),
-        "knee_angle":           get_cue("knee_angle",           knee_angle,     std["knee_angle"][:2]),
-        "shoulder_angle":       get_cue("shoulder_angle",       shoulder_angle, sh_ideal),
-        "wrist_elbow_vertical": get_cue("wrist_elbow_v",        wrist_elbow_v,  std["wrist_elbow_v"][:2], True),
-        "hip_knee_alignment":   get_cue("hip_knee_align",       hip_knee_align, (0, 0.08),                True),
+        "elbow_angle":          get_cue("elbow_angle",    elbow_angle,    std["elbow_angle"][:2]),
+        "knee_angle":           get_cue("knee_angle",     knee_angle,     std["knee_angle"][:2]),
+        "shoulder_angle":       get_cue("shoulder_angle", shoulder_angle, sh_ideal),
+        "wrist_elbow_vertical": get_cue("wrist_elbow_v",  wrist_elbow_v,  std["wrist_elbow_v"][:2], True),
+        "hip_knee_alignment":   get_cue("hip_knee_align", hip_knee_align, (0, 0.08),                True),
     }
 
     grade = ("A" if overall>=88 else "B" if overall>=75 else
@@ -372,13 +309,6 @@ def extract_metrics(kp: np.ndarray, kp_raw: np.ndarray) -> Dict:
 # ── Shooter selection ──────────────────────────────────────────────────────────
 
 def pick_shooter(results, frame_shape: Tuple) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Selects the primary shooter with three fallback tiers:
-      Tier 1 (strict)  : bbox > 6%, arm conf > 0.20  — dataset images, crowded courts
-      Tier 2 (lenient) : bbox > 1.5%, arm conf > 0.10 — external photos, wide shots
-      Tier 3 (any)     : at least one body keypoint visible — last resort
-    This ensures external/personal images always get analysed.
-    """
     if results[0].keypoints is None or len(results[0].keypoints.xyn) == 0:
         return None, None
 
@@ -391,20 +321,16 @@ def pick_shooter(results, frame_shape: Tuple) -> Tuple[Optional[np.ndarray], Opt
             kp_n = results[0].keypoints.xyn[i].cpu().numpy()
             kp_r = results[0].keypoints.data[i].cpu().numpy()
             if kp_n.shape[0] != 17: continue
-
             if i < len(results[0].boxes):
                 box       = results[0].boxes[i].xyxy[0].cpu().numpy()
                 bbox_frac = ((box[2]-box[0])*(box[3]-box[1])) / (img_area + 1e-8)
             else:
-                bbox_frac = 1.0   # no box info → don't penalise
-
+                bbox_frac = 1.0
             if bbox_frac < min_bbox_frac: continue
-
             arm_joints = [KP["r_elbow"], KP["r_wrist"],
                           KP["l_elbow"], KP["l_wrist"]]
             arm_confs  = [kp_conf(kp_r, j) for j in arm_joints]
             if max(arm_confs) < min_arm_conf: continue
-
             wrist_score = 1.0 - min(float(kp_n[KP["r_wrist"]][1]),
                                      float(kp_n[KP["l_wrist"]][1]))
             cx          = ((box[0]+box[2])/2)/img_w if i < len(results[0].boxes) else 0.5
@@ -413,21 +339,16 @@ def pick_shooter(results, frame_shape: Tuple) -> Tuple[Optional[np.ndarray], Opt
             total       = (wrist_score*0.50 + max(arm_confs)*0.25 +
                            centrality*0.15  + size_score*0.10)
             candidates.append((total, i, kp_n, kp_r))
-
         if not candidates: return None, None
         candidates.sort(key=lambda x: x[0], reverse=True)
         _, _, kp_norm, kp_raw = candidates[0]
         return kp_norm, kp_raw
 
-    # Tier 1 — strict (filters crowd in dataset images)
     result = _score_candidates(min_bbox_frac=0.06, min_arm_conf=0.20)
     if result[0] is not None: return result
-
-    # Tier 2 — lenient (catches subjects in wide-angle or high-res external photos)
     result = _score_candidates(min_bbox_frac=0.015, min_arm_conf=0.10)
     if result[0] is not None: return result
 
-    # Tier 3 — any person with any visible keypoints (single-subject photos)
     best_idx, best_total = 0, -1.0
     for i in range(len(results[0].keypoints.xyn)):
         kp_n = results[0].keypoints.xyn[i].cpu().numpy()
@@ -437,17 +358,14 @@ def pick_shooter(results, frame_shape: Tuple) -> Tuple[Optional[np.ndarray], Opt
         total      = float(np.mean(body_confs))
         if total > best_total:
             best_total = total; best_idx = i
-
     if best_total > 0.05:
         kp_norm = results[0].keypoints.xyn[best_idx].cpu().numpy()
         kp_raw  = results[0].keypoints.data[best_idx].cpu().numpy()
         return kp_norm, kp_raw
-
     return None, None
 
 
 def _find_shooter_idx(results, frame_shape: Tuple) -> int:
-    """Returns index of the shooter in results."""
     img_h, img_w = frame_shape[:2]
     img_area     = img_h * img_w
     best_idx, best_score = 0, -1.0
@@ -528,7 +446,6 @@ def draw_overlay(frame: np.ndarray, m: Dict) -> np.ndarray:
     cv2.putText(frame,"Side:  "+m["side"],(10,52),
                 cv2.FONT_HERSHEY_SIMPLEX,0.44,(180,180,180),1)
 
-    # FIX #4: use correct score keys
     rows = [
         ("Elbow",    m["elbow_angle"],         m["scores"]["elbow_angle"],          "deg"),
         ("Knee",     m["knee_angle"],           m["scores"]["knee_angle"],           "deg"),
@@ -571,14 +488,11 @@ def process_image(image_path: Path) -> Optional[Dict]:
 
     frame = ensure_color(frame)
 
-    # Resize very large images (phone photos etc.) to max 1280px wide
-    # so bbox_frac calculations are consistent and inference is faster
     h, w = frame.shape[:2]
     if w > 1280:
         scale = 1280 / w
         frame = cv2.resize(frame, (1280, int(h * scale)))
 
-    # Try four confidence levels — ensures external images always work
     kp_norm, kp_raw, results = None, None, None
     for conf in [0.45, 0.30, 0.20, 0.10]:
         results  = model(frame, verbose=False, conf=conf)
@@ -587,18 +501,16 @@ def process_image(image_path: Path) -> Optional[Dict]:
             break
 
     if kp_norm is None:
-        # Absolute last resort: run on resized smaller version
         small    = cv2.resize(frame, (640, int(frame.shape[0] * 640 / frame.shape[1])))
         results  = model(small, verbose=False, conf=0.10)
         kp_norm, kp_raw = pick_shooter(results, small.shape)
         if kp_norm is None:
-            # Write original with "no pose" label so user gets feedback
             out = frame.copy()
             cv2.putText(out, "No person detected — try a clearer image",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 80, 255), 2)
             cv2.imwrite(str(OUTPUT_IMAGES / image_path.name), out)
             return None
-        frame = small   # use the small frame for annotation
+        frame = small
 
     shooter_idx = _find_shooter_idx(results, frame.shape)
     annotated   = _draw_only_shooter(results, shooter_idx, frame)
@@ -615,7 +527,13 @@ def process_image(image_path: Path) -> Optional[Dict]:
 
     annotated = draw_overlay(annotated, metrics)
     metrics["image"] = image_path.name
+
+    # ── KEY FIX: store annotated frame in metrics so app.py can display it ──
+    metrics["annotated_frame"] = annotated
+
+    OUTPUT_IMAGES.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(OUTPUT_IMAGES / image_path.name), annotated)
+
     return metrics
 
 # ── Batch ──────────────────────────────────────────────────────────────────────
