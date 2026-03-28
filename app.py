@@ -644,9 +644,18 @@ with tab_img:
                 st.markdown(f"---\n#### {f.name}")
                 if metrics:
                     all_metrics.append(metrics)
-                    ann = OUTPUT_IMAGES / f.name
-                    if ann.exists():
-                        st.image(str(ann), use_container_width=True)
+
+                    # ── Annotated image preview ────────────────────────
+                    ann_path = OUTPUT_IMAGES / f.name
+                    if ann_path.exists():
+                        st.image(str(ann_path), use_container_width=True)
+                    else:
+                        # Fallback: decode annotated frame directly from metrics
+                        ann_frame = metrics.get("annotated_frame")
+                        if ann_frame is not None:
+                            rgb = cv2.cvtColor(ann_frame, cv2.COLOR_BGR2RGB)
+                            st.image(rgb, use_container_width=True)
+
                     render_score_panel(metrics)
                     render_ml_panel(metrics)
                 else:
