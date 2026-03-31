@@ -29,9 +29,7 @@ METRICS_DIR = ROOT / "outputs" / "prediction_results"
 XGB_PATH    = MODELS_DIR / "xgb_form_scorer.json"
 SCALER_PATH = MODELS_DIR / "knn_scaler.pkl"
 
-# FIX #5: Expanded to 22 pro players with diverse styles
 PRO_PLAYER_DB = [
-    # Pure shooters
     {"name":"Stephen Curry",    "team":"Golden State Warriors", "style":"high arc quick release",
      "elbow_angle":88,  "knee_angle":118, "shoulder_angle":68, "wrist_elbow_v":12, "hip_knee_align":0.05,
      "notes":"One-motion shot, extremely consistent elbow tuck"},
@@ -59,7 +57,6 @@ PRO_PLAYER_DB = [
     {"name":"Devin Booker",     "team":"Phoenix Suns", "style":"mid-range fundamentals",
      "elbow_angle":89,  "knee_angle":120, "shoulder_angle":63, "wrist_elbow_v":10, "hip_knee_align":0.05,
      "notes":"Kobe-inspired mid-range mechanics, excellent follow-through"},
-    # Power / athletic shooters
     {"name":"Kevin Durant",     "team":"Phoenix Suns", "style":"high release height",
      "elbow_angle":92,  "knee_angle":128, "shoulder_angle":72, "wrist_elbow_v":14, "hip_knee_align":0.04,
      "notes":"Elite shoulder elevation, releases above defenders"},
@@ -75,7 +72,6 @@ PRO_PLAYER_DB = [
     {"name":"Nikola Jokic",     "team":"Denver Nuggets", "style":"unorthodox but effective",
      "elbow_angle":108, "knee_angle":114, "shoulder_angle":58, "wrist_elbow_v":22, "hip_knee_align":0.13,
      "notes":"Unconventional push shot but high release point works"},
-    # Fadeaways / specialised
     {"name":"Dirk Nowitzki",    "team":"Retired", "style":"one legged fadeaway",
      "elbow_angle":98,  "knee_angle":145, "shoulder_angle":78, "wrist_elbow_v":22, "hip_knee_align":0.18,
      "notes":"Higher elbow and knee extension — unique one-legged fadeaway"},
@@ -88,7 +84,6 @@ PRO_PLAYER_DB = [
     {"name":"Paul Pierce",      "team":"Retired", "style":"shot fake and rise",
      "elbow_angle":96,  "knee_angle":116, "shoulder_angle":62, "wrist_elbow_v":17, "hip_knee_align":0.08,
      "notes":"Slightly unorthodox but effective elbow position"},
-    # Modern guards
     {"name":"Jayson Tatum",     "team":"Boston Celtics", "style":"versatile scorer",
      "elbow_angle":87,  "knee_angle":122, "shoulder_angle":66, "wrist_elbow_v":12, "hip_knee_align":0.06,
      "notes":"Clean mechanics, good knee drive, consistent release"},
@@ -104,6 +99,14 @@ PRO_PLAYER_DB = [
 ]
 
 FEATURE_COLS = ["elbow_angle","knee_angle","shoulder_angle","wrist_elbow_v","hip_knee_align"]
+
+PHASE_IDEALS = {
+    "loading":        {"elbow":(85,115), "knee":(95,125),  "shoulder":(30,55)},
+    "set":            {"elbow":(80,100), "knee":(100,130), "shoulder":(48,72)},
+    "release":        {"elbow":(78,108), "knee":(125,175), "shoulder":(58,88)},
+    "follow_through": {"elbow":(138,180),"knee":(148,180), "shoulder":(62,90)},
+    "not_shooting":   {"elbow":(60,120), "knee":(155,180), "shoulder":(0,30)},
+}
 
 
 def _player_features(p: Dict) -> np.ndarray:
@@ -124,42 +127,47 @@ def metrics_to_features(m: Dict) -> Optional[np.ndarray]:
         return None
 
 
-PHASE_IDEALS = {
-    "loading":        {"elbow":(85,115), "knee":(95,125),  "shoulder":(30,55)},
-    "set":            {"elbow":(80,100), "knee":(100,130), "shoulder":(48,72)},
-    "release":        {"elbow":(78,108), "knee":(125,175), "shoulder":(58,88)},
-    "follow_through": {"elbow":(138,180),"knee":(148,180), "shoulder":(62,90)},
-    "not_shooting":   {"elbow":(60,120), "knee":(155,180), "shoulder":(0,30)},
-}
-
-
 def _rule_score(features: np.ndarray, phase: str = "set") -> float:
-    elbow,knee,shoulder,wrist_v,hip = features
+    """
+    Strict rule score — matches the scoring in shooting_metrics.py and image_inference.py.
+    Ideal: 75-90, Acceptable: 35-74, Outside: 0-34
+    """
+    elbow, knee, shoulder, wrist_v, hip = features
     ideals = PHASE_IDEALS.get(phase, PHASE_IDEALS["set"])
-    def s(val,imin,imax,am,ax):
-        if imin<=val<=imax:
-            c=(imin+imax)/2; sp=(imax-imin)/2+1e-8
-            return min(100,85+15*max(0,1-abs(val-c)/sp))
-        elif am<=val<=ax:
-            return 50+35*((val-am)/(imin-am+1e-8) if val<imin else (ax-val)/(ax-imax+1e-8))
-        m=25.0
-        return max(0,50*(val-(am-m))/m if val<am else 50*((ax+m)-val)/m)
-    ei,ki,si = ideals["elbow"],ideals["knee"],ideals["shoulder"]
+
+    def s(val, imin, imax, am, ax):
+        if imin <= val <= imax:
+            c  = (imin + imax) / 2
+            sp = (imax - imin) / 2 + 1e-8
+            return min(90, 75 + 15 * max(0, 1 - abs(val - c) / sp))
+        elif am <= val <= ax:
+            if val < imin:
+                return 35 + 39 * (val - am) / (imin - am + 1e-8)
+            else:
+                return 35 + 39 * (ax - val) / (ax - imax + 1e-8)
+        m = 20.0
+        if val < am:
+            return max(0, 35 * (val - (am - m)) / m)
+        return max(0, 35 * ((ax + m) - val) / m)
+
+    ei, ki, si = ideals["elbow"], ideals["knee"], ideals["shoulder"]
     scores = {
-        "elbow":    s(elbow,   ei[0],ei[1],ei[0]-15,ei[1]+20),
-        "knee":     s(knee,    ki[0],ki[1],ki[0]-15,ki[1]+25),
-        "shoulder": s(shoulder,si[0],si[1],si[0]-15,si[1]+15),
-        "wrist_v":  max(0,100-wrist_v*2.0),
-        "hip":      max(0,100-hip*350),
+        "elbow":    s(elbow,    ei[0], ei[1], ei[0]-15, ei[1]+20),
+        "knee":     s(knee,     ki[0], ki[1], ki[0]-15, ki[1]+25),
+        "shoulder": s(shoulder, si[0], si[1], si[0]-15, si[1]+15),
+        "wrist_v":  max(0, 90 - wrist_v * 2.5),
+        "hip":      max(0, 90 - hip * 400),
     }
-    return float(sum(v*w for v,w in zip(scores.values(),[0.30,0.20,0.20,0.15,0.15])))
+    return float(sum(v * w for v, w in zip(
+        scores.values(), [0.30, 0.20, 0.20, 0.15, 0.15]
+    )))
 
 
 def generate_training_data(n: int = 6000) -> Tuple[np.ndarray, np.ndarray]:
     np.random.seed(42)
     X, y = [], []
-    for phase,ideals in PHASE_IDEALS.items():
-        ei,ki,si = ideals["elbow"],ideals["knee"],ideals["shoulder"]
+    for phase, ideals in PHASE_IDEALS.items():
+        ei, ki, si = ideals["elbow"], ideals["knee"], ideals["shoulder"]
         centre = np.array([(ei[0]+ei[1])/2,(ki[0]+ki[1])/2,(si[0]+si[1])/2,12.0,0.06],dtype=np.float32)
         ns = n // (len(PHASE_IDEALS)*3)
         for s in centre + np.random.normal(0,1,(ns,5))*[8,12,8,4,0.02]:
@@ -190,7 +198,7 @@ class XGBoostFormScorer:
         self.model.fit(X_tr,y_tr,eval_set=[(X_val,y_val)],verbose=False)
         preds = self.model.predict(X_val)
         imp   = dict(zip(FEATURE_COLS,[round(float(x),4) for x in self.model.feature_importances_]))
-        MODELS_DIR.mkdir(parents=True,exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
         self.model.save_model(str(XGB_PATH))
         return {"val_mae":round(float(np.mean(np.abs(preds-y_val))),2),
                 "feature_importance":imp}
@@ -202,16 +210,20 @@ class XGBoostFormScorer:
     def predict(self, features: np.ndarray, phase: str = "set") -> Dict:
         rule = _rule_score(features, phase)
         if self.model is not None:
-            score = round(float(np.clip(self.model.predict(features.reshape(1,-1))[0],0,100))*0.6+rule*0.4,1)
-            source = "xgboost+rules"
+            raw_xgb      = float(np.clip(self.model.predict(features.reshape(1,-1))[0],0,100))
+            dampened_xgb = raw_xgb * 0.80
+            score        = round(dampened_xgb * 0.30 + rule * 0.70, 1)
+            source       = "xgboost+rules"
         else:
-            score = round(rule,1); source = "rules_only"
+            # No model file — rules only
+            score  = round(rule, 1)
+            source = "rules_only"
         imp  = dict(zip(FEATURE_COLS,self.model.feature_importances_)) if self.model else {}
         top  = max(imp,key=imp.get).replace("_"," ") if imp else "elbow angle"
-        if score>=85: exp="Excellent form — all angles ideal for this phase"
-        elif score>=70: exp="Good form — main area to refine: "+top
-        elif score>=50: exp="Average form — focus on: "+top
-        else: exp="Needs work — primary issue: "+top
+        if score>=75:  exp="Excellent form — all angles ideal for this phase"
+        elif score>=55: exp="Good form — main area to refine: "+top
+        elif score>=35: exp="Average form — focus on: "+top
+        else:           exp="Needs work — primary issue: "+top
         return {"xgb_score":score,"explanation":exp,"top_factor":top,"source":source}
 
 
@@ -223,7 +235,7 @@ class KNNStyleMatcher:
         X_raw = np.array([_player_features(p) for p in PRO_PLAYER_DB])
         self.scaler = StandardScaler(); self.X_db = self.scaler.fit_transform(X_raw)
         self._ready = True
-        MODELS_DIR.mkdir(parents=True,exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
         with open(SCALER_PATH,"wb") as f: pickle.dump(self.scaler,f)
         return True
 
@@ -239,9 +251,6 @@ class KNNStyleMatcher:
     def match(self, features: np.ndarray, phase: str = "set") -> Dict:
         if not self._ready: self.load()
 
-        # Phase correction: convert measured angles to set-point equivalent
-        # so follow-through / release angles compare fairly against pro DB
-        # (which stores set-point angles for all players)
         PHASE_CORR = {
             "follow_through": {"elbow": -55, "knee": -42},
             "release":        {"elbow": -18, "knee": -22},
@@ -264,7 +273,6 @@ class KNNStyleMatcher:
         dists   = np.linalg.norm(db - q, axis=1)
         top_idx = np.argsort(dists)[:min(self.k, len(PRO_PLAYER_DB))]
 
-        # Calibrate decay constant from median distance in DB
         median_dist = float(np.median(dists))
         decay = max(2.0, median_dist / 2.0)
 
@@ -272,11 +280,7 @@ class KNNStyleMatcher:
         for rank, idx in enumerate(top_idx):
             player = PRO_PLAYER_DB[idx]
             dist   = float(dists[idx])
-
-            # Exponential decay similarity — always non-zero, meaningful at any distance
             similarity = round(100.0 * float(np.exp(-dist / decay)), 1)
-
-            # Show diffs against ORIGINAL angles (not corrected) for honest advice
             pf    = _player_features(player)
             diffs = features - pf
             advice = []
@@ -288,7 +292,6 @@ class KNNStyleMatcher:
                     advice.append(fn + " is " + f"{abs(diff):.1f}" + unit +
                                   (" higher" if diff > 0 else " lower") +
                                   " than " + player["name"] + " at set point")
-
             matches.append({
                 "rank":       rank + 1,
                 "name":       player["name"],
