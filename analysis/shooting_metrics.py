@@ -1,21 +1,10 @@
 """
 analysis/shooting_metrics.py
-------------------------------
-Biomechanical evaluation of basketball shooting form.
-Compares measured joint angles against NBA coaching / sports science standards
-and produces structured scores, flags, and coaching cues per image and in aggregate.
 """
 
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
-
-# ── Reference standards ────────────────────────────────────────────────────────
-#
-# Sources: NBA coaching manuals, peer-reviewed biomechanics research
-# (Okazaki & Rodacki 2012; Nakano et al. 2020; Hayes 2018)
-#
-# Format: (ideal_min, ideal_max, acceptable_min, acceptable_max)
 
 STANDARDS = {
     "elbow_angle": {
@@ -81,50 +70,44 @@ STANDARDS = {
 }
 
 
-# ── Scoring ────────────────────────────────────────────────────────────────────
-
 def score_metric(value: float, ideal: Tuple, acceptable: Tuple,
                  lower_is_better: bool = False) -> int:
     """
-    Returns 0–100 score for a single metric value.
-    - 85–100 : inside ideal range
-    - 50–84  : inside acceptable range only
-    -  0–49  : outside acceptable range
+    Stricter scoring:
+    - Inside ideal range:      75–90  (previously 85–100)
+    - Inside acceptable range: 35–74  (previously 50–84)
+    - Outside acceptable:       0–34  (previously 0–49)
     """
     if lower_is_better:
         _, imax = ideal
         _, amax = acceptable
         if value <= imax:
-            return int(85 + 15 * max(0.0, 1.0 - value / (imax + 1e-8)))
+            return int(75 + 15 * max(0.0, 1.0 - value / (imax + 1e-8)))
         elif value <= amax:
-            return int(50 + 35 * (amax - value) / (amax - imax + 1e-8))
+            return int(35 + 39 * (amax - value) / (amax - imax + 1e-8))
         else:
-            return max(0, int(50 * (amax * 2.0 - value) / (amax + 1e-8)))
+            return max(0, int(35 * (amax * 2.0 - value) / (amax + 1e-8)))
     else:
         imin, imax = ideal
         amin, amax = acceptable
         if imin <= value <= imax:
             centre = (imin + imax) / 2.0
             spread = (imax - imin) / 2.0 + 1e-8
-            return int(85 + 15 * max(0.0, 1.0 - abs(value - centre) / spread))
+            return int(75 + 15 * max(0.0, 1.0 - abs(value - centre) / spread))
         elif amin <= value <= amax:
             if value < imin:
-                return int(50 + 35 * (value - amin) / (imin - amin + 1e-8))
+                return int(35 + 39 * (value - amin) / (imin - amin + 1e-8))
             else:
-                return int(50 + 35 * (amax - value) / (amax - imax + 1e-8))
+                return int(35 + 39 * (amax - value) / (amax - imax + 1e-8))
         else:
-            margin = 30.0
+            margin = 20.0
             if value < amin:
-                return max(0, int(50 * (value - (amin - margin)) / margin))
+                return max(0, int(35 * (value - (amin - margin)) / margin))
             else:
-                return max(0, int(50 * ((amax + margin) - value) / margin))
+                return max(0, int(35 * ((amax + margin) - value) / margin))
 
 
 def score_frame(metrics: Dict) -> Dict:
-    """
-    Takes a metrics dict (from image_inference.extract_metrics) and returns
-    a full scoring report with per-metric scores, overall score, and coaching cues.
-    """
     lower_is_better_keys = {"hip_knee_alignment", "wrist_elbow_vertical"}
     scores   = {}
     feedback = {}
@@ -141,7 +124,6 @@ def score_frame(metrics: Dict) -> Dict:
         amin, amax = std["acceptable"]
         if lb:
             _, imax_ = std["ideal"]
-            _, amax_ = std["acceptable"]
             if val <= imax_:
                 cue = std["cues"]["perfect"]
             else:
@@ -155,15 +137,12 @@ def score_frame(metrics: Dict) -> Dict:
                 cue = std["cues"]["too_high"] or std["cues"]["perfect"]
         feedback[key] = cue
 
-    # Weighted overall
     total_w = sum(STANDARDS[k]["weight"] for k in scores)
     overall = int(sum(scores[k] * STANDARDS[k]["weight"] for k in scores) / total_w)
 
-    # Priority coaching cue = worst-scoring metric
-    worst_key = min(scores, key=lambda k: scores[k])
+    worst_key    = min(scores, key=lambda k: scores[k])
     priority_cue = feedback[worst_key]
 
-    # Grade
     if overall >= 88:    grade = "A"
     elif overall >= 75:  grade = "B"
     elif overall >= 60:  grade = "C"
@@ -180,13 +159,7 @@ def score_frame(metrics: Dict) -> Dict:
     }
 
 
-# ── Aggregate analysis ─────────────────────────────────────────────────────────
-
 def aggregate_session(all_metrics: List[Dict]) -> Dict:
-    """
-    Aggregates per-frame metrics across a full image set / session.
-    Returns averages, consistency scores, phase distribution, and top issues.
-    """
     if not all_metrics:
         return {}
 
@@ -196,21 +169,19 @@ def aggregate_session(all_metrics: List[Dict]) -> Dict:
                   "wrist_elbow_vertical", "hip_knee_alignment"]
 
     aggregated: Dict = {
-        "total_frames":     len(all_metrics),
-        "avg_overall":      0.0,
+        "total_frames":       len(all_metrics),
+        "avg_overall":        0.0,
         "grade_distribution": {},
         "phase_distribution": {},
-        "per_metric": {},
-        "top_issues": [],
-        "consistency": {},
-        "recommendations": [],
+        "per_metric":         {},
+        "top_issues":         [],
+        "consistency":        {},
+        "recommendations":    [],
     }
 
-    # Overall score stats
     overall_scores = [m.get("overall_score", 0) for m in all_metrics]
     aggregated["avg_overall"] = round(float(np.mean(overall_scores)), 1)
 
-    # Grade distribution
     grades = []
     for sc in overall_scores:
         if sc >= 88:    grades.append("A")
@@ -220,11 +191,9 @@ def aggregate_session(all_metrics: List[Dict]) -> Dict:
         else:           grades.append("F")
     aggregated["grade_distribution"] = dict(Counter(grades))
 
-    # Phase distribution
     phases = [m.get("phase", "unknown") for m in all_metrics]
     aggregated["phase_distribution"] = dict(Counter(phases))
 
-    # Per-metric averages + consistency (lower std = more consistent)
     for key in angle_keys:
         vals = [m[key] for m in all_metrics if key in m]
         if not vals:
@@ -238,13 +207,11 @@ def aggregate_session(all_metrics: List[Dict]) -> Dict:
             "max":         round(float(np.max(vals)),  2),
             "ideal_range": ideal,
         }
-        # Consistency: what % of frames are inside ideal range
         if STANDARDS.get(key):
             imin, imax = STANDARDS[key]["ideal"]
             in_ideal = sum(1 for v in vals if imin <= v <= imax)
             aggregated["consistency"][key] = round(100 * in_ideal / len(vals), 1)
 
-    # Top 3 recurring issues (from worst-metric per frame)
     issues = []
     for m in all_metrics:
         if "scores" in m:
@@ -254,19 +221,16 @@ def aggregate_session(all_metrics: List[Dict]) -> Dict:
     top_issues = Counter(issues).most_common(3)
     aggregated["top_issues"] = [{"issue": i, "count": c} for i, c in top_issues]
 
-    # Session recommendations
     recs = []
     for key, cons in aggregated["consistency"].items():
         if cons < 50:
             cue = STANDARDS[key]["cues"]["too_high"] or STANDARDS[key]["cues"]["too_low"]
             if cue:
                 recs.append("Work on " + STANDARDS[key]["name"] + ": " + cue)
-    aggregated["recommendations"] = recs[:3]   # top 3
+    aggregated["recommendations"] = recs[:3]
 
     return aggregated
 
-
-# ── Quick CLI for standalone use ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json, sys

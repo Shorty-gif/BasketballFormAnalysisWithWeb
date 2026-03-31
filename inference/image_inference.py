@@ -200,23 +200,29 @@ def detect_side(kp: np.ndarray, kp_raw: np.ndarray) -> str:
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
 def score_metric(val, ideal, acceptable, lower_is_better=False) -> int:
+    """
+    Stricter scoring:
+    - Inside ideal range:      75-90  (previously 85-100)
+    - Inside acceptable range: 35-74  (previously 50-84)
+    - Outside acceptable:       0-34  (previously 0-49)
+    """
     if lower_is_better:
         _, imax = ideal; _, amax = acceptable
         if val <= imax:
-            return int(85 + 15 * max(0.0, 1.0 - val / (imax + 1e-8)))
+            return int(75 + 15 * max(0.0, 1.0 - val / (imax + 1e-8)))
         elif val <= amax:
-            return int(50 + 35 * (amax - val) / (amax - imax + 1e-8))
-        return max(0, int(50 * (amax * 2 - val) / (amax + 1e-8)))
+            return int(35 + 39 * (amax - val) / (amax - imax + 1e-8))
+        return max(0, int(35 * (amax * 2 - val) / (amax + 1e-8)))
     imin, imax = ideal; amin, amax = acceptable
     if imin <= val <= imax:
         c = (imin + imax) / 2; sp = (imax - imin) / 2 + 1e-8
-        return int(85 + 15 * max(0.0, 1.0 - abs(val - c) / sp))
+        return int(75 + 15 * max(0.0, 1.0 - abs(val - c) / sp))
     elif amin <= val <= amax:
-        if val < imin: return int(50 + 35 * (val - amin) / (imin - amin + 1e-8))
-        return int(50 + 35 * (amax - val) / (amax - imax + 1e-8))
-    m = 25.0
-    if val < amin: return max(0, int(50 * (val - (amin - m)) / m))
-    return max(0, int(50 * ((amax + m) - val) / m))
+        if val < imin: return int(35 + 39 * (val - amin) / (imin - amin + 1e-8))
+        return int(35 + 39 * (amax - val) / (amax - imax + 1e-8))
+    m = 20.0
+    if val < amin: return max(0, int(35 * (val - (amin - m)) / m))
+    return max(0, int(35 * ((amax + m) - val) / m))
 
 # ── Metrics extraction ─────────────────────────────────────────────────────────
 
@@ -417,8 +423,8 @@ def _draw_only_shooter(results, shooter_idx: int, frame: np.ndarray) -> np.ndarr
 # ── Overlay ────────────────────────────────────────────────────────────────────
 
 def score_color(s: int) -> Tuple:
-    if s >= 85: return (50, 220, 100)
-    if s >= 60: return (50, 200, 255)
+    if s >= 75: return (50, 220, 100)
+    if s >= 35: return (50, 200, 255)
     return (50, 80, 230)
 
 def draw_overlay(frame: np.ndarray, m: Dict) -> np.ndarray:
@@ -528,7 +534,7 @@ def process_image(image_path: Path) -> Optional[Dict]:
     annotated = draw_overlay(annotated, metrics)
     metrics["image"] = image_path.name
 
-    # ── KEY FIX: store annotated frame in metrics so app.py can display it ──
+    # Store annotated frame in metrics so app.py can display it
     metrics["annotated_frame"] = annotated
 
     OUTPUT_IMAGES.mkdir(parents=True, exist_ok=True)
